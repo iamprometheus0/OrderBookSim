@@ -53,19 +53,12 @@ def match_orders():
             sell_orders.pop(0)
 
 
-# ----------------------------
-# Simulation
-# ----------------------------
-
 for _ in range(NUM_EVENTS):
     place_order()
     sort_books()
     match_orders()
 
 
-# ----------------------------
-# Build tick-based candles (OHLC)
-# ----------------------------
 
 candles = []
 for i in range(0, len(trade_ticks), TICKS_PER_CANDLE):
@@ -81,10 +74,6 @@ for i in range(0, len(trade_ticks), TICKS_PER_CANDLE):
 
     candles.append([i, open_price, high_price, low_price, close_price])
 
-
-# ----------------------------
-# Plot
-# ----------------------------
 
 fig, ax = plt.subplots()
 ax.set_title("Tick-Based Candle Chart from Order Book Simulation")
