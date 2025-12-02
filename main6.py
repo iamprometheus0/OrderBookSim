@@ -1,29 +1,27 @@
 """
-Realistic Market Order-Book Simulator (Dash)
-- Builds on previous orderbook simulator.
-- Adds: autocorrelated order flow, volatility-sensitive sizes,
-  price-impact gradient, c-shaped depth, replenishment/iceberg logic.
-- Dash UI shows 1-min candles and 12-level L2 depth; updates every second.
-
+Realistic Market Order-Book Simulator (Dash) — Minimal Refactor (Option A)
+- Single-file, cleaned & organized.
+- Adds OFI tracking + OFI time-series chart under candles.
+- Maintains all previous features and visualizations.
 Run:
     python3 main_realistic.py
 """
 
 from __future__ import annotations
 import uuid
-from collections import deque, defaultdict
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
 from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 import plotly.graph_objects as go
 
-# ----------------------------------------
-# Basic helpers & models (Order / Trade)
-# ----------------------------------------
+# -----------------------
+# Helpers & Data Models
+# -----------------------
 
 def new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:10]}"
@@ -35,7 +33,7 @@ def round_price(p: float, tick: float) -> float:
 class Order:
     order_id: str
     side: str                # "BUY" / "SELL"
-    type: str                # "LIMIT" / "MARKET" / "STOP"
+    type: str                # "LIMIT" / "MARKET" / "STOP" / "STOP_LIMIT"
     price: Optional[float]
     qty: float
     remaining: float
@@ -44,7 +42,7 @@ class Order:
     tif: Optional[str] = None
     stop_price: Optional[float] = None
     status: str = "OPEN"     # OPEN / PARTIAL / FILLED / CANCELLED
-    iceberg_total: Optional[float] = None  # for iceberg behaviour
+    iceberg_total: Optional[float] = None
     iceberg_display: Optional[float] = None
 
 @dataclass
@@ -58,9 +56,9 @@ class TradeEvent:
     taker_order_id: str
     seq: int
 
-# ----------------------------------------
-# Matching engine (OrderBook)
-# ----------------------------------------
+# -----------------------
+# Matching Engine: OrderBook
+# -----------------------
 
 class OrderBook:
     def __init__(self, tick_size: float = 0.25):
@@ -78,7 +76,11 @@ class OrderBook:
         self.last_trade_price: Optional[float] = None
         self.last_trade_time: Optional[datetime] = None
 
-    # ---- sequence helpers ----
+        # OFI tracking
+        self.prev_snapshot: Optional[Tuple[float, float]] = None  # (bid_vol, ask_vol)
+        self.ofi: float = 0.0
+
+    # Sequence helpers
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
@@ -87,12 +89,11 @@ class OrderBook:
         self._trade_seq += 1
         return self._trade_seq
 
-    # ---- price-level helpers ----
+    # Price-level helpers
     def _insert_level(self, price: float, side: str):
         if side == "BUY":
             if price not in self.bids:
                 self.bids[price] = deque()
-                # keep bid_prices descending
                 i = 0
                 while i < len(self.bid_prices) and self.bid_prices[i] > price:
                     i += 1
@@ -119,7 +120,7 @@ class OrderBook:
                 if price in self.ask_prices:
                     self.ask_prices.remove(price)
 
-    # ---- top-of-book / mid ----
+    # Top-of-book / mid
     def best_bid(self) -> Optional[Tuple[float, float]]:
         if not self.bid_prices:
             return None
@@ -143,23 +144,27 @@ class OrderBook:
             return self.last_trade_price
         return None
 
-    # ---- submit / cancel ----
+    # Submit / cancel
     def submit_order(self, side: str, order_type: str, qty: float,
                      price: Optional[float], now: datetime,
                      time_in_force: Optional[str] = None,
                      stop_price: Optional[float] = None,
                      iceberg_total: Optional[float] = None,
                      iceberg_display: Optional[float] = None) -> Order:
+
         seq = self._next_seq()
         oid = new_id("o")
         o = Order(order_id=oid, side=side, type=order_type, price=price,
                   qty=qty, remaining=qty, timestamp=now, seq=seq,
                   tif=time_in_force, stop_price=stop_price,
                   iceberg_total=iceberg_total, iceberg_display=iceberg_display)
-        # Stop orders sit in stop_orders
+
+        # Stop orders kept separately
         if order_type in ("STOP", "STOP_LIMIT"):
             self.stop_orders.append(o)
             self.order_map[oid] = o
+            # OFI: book state changed by adding a stop order
+            self.compute_ofi()
             return o
 
         # Route to matching core
@@ -169,7 +174,7 @@ class OrderBook:
             self.last_trade_price = t.price
             self.last_trade_time = t.timestamp
 
-        # If remainder exists, insert passive if allowed
+        # Insert remainder as passive if allowed
         if remainder.remaining > 0:
             if remainder.tif == "IOC":
                 remainder.status = "CANCELLED"
@@ -179,8 +184,11 @@ class OrderBook:
             remainder.status = "FILLED"
         self.order_map[oid] = remainder
 
-        # After trades, check stops & triggers
+        # Check stops after trades
         self._check_stop_triggers(now)
+
+        # OFI after all state changes
+        self.compute_ofi()
         return remainder
 
     def cancel_order(self, order_id: str) -> bool:
@@ -196,16 +204,16 @@ class OrderBook:
                     dq.remove(el)
                     o.status = "CANCELLED"
                     self._remove_level_if_empty(price, side)
+                    # OFI: book volume removed
+                    self.compute_ofi()
                     return True
         return False
 
-    # ---- matching core (FIFO / price-time) ----
+    # Matching core
     def _match(self, incoming: Order, now: datetime) -> Tuple[Order, List[TradeEvent]]:
         trades: List[TradeEvent] = []
-        # market order: no limit; else use price limit
         price_limit = None if incoming.type == "MARKET" else incoming.price
 
-        # When incoming is aggressive, iterate opposite side
         while incoming.remaining > 0:
             opposite_prices = self.ask_prices if incoming.side == "BUY" else self.bid_prices
             if not opposite_prices:
@@ -234,7 +242,7 @@ class OrderBook:
                     seq=self._next_trade_seq()
                 )
                 trades.append(t)
-                # update
+                # update sizes/statuses
                 incoming.remaining -= trade_qty
                 maker.remaining -= trade_qty
                 if maker.remaining <= 0:
@@ -242,15 +250,12 @@ class OrderBook:
                     level_dq.popleft()
                 else:
                     maker.status = "PARTIAL"
-                    # iceberg behaviour: if maker had iceberg and display exhausted,
-                    # replenish visible slice (handled by replenishment module later)
                 self.order_map.setdefault(maker.order_id, maker)
-            # after level exhausted
+            # remove empty level
             self._remove_level_if_empty(best_price, "SELL" if incoming.side == "BUY" else "BUY")
         return incoming, trades
 
     def _insert_passive(self, order: Order):
-        # Insert limit order at level with FIFO
         if order.price is None:
             order.status = "CANCELLED"
             return
@@ -261,7 +266,7 @@ class OrderBook:
         dq.append(order)
         order.status = "OPEN"
 
-    # ---- stop triggers ----
+    # Stop triggers
     def _check_stop_triggers(self, now: datetime):
         if not self.stop_orders:
             return
@@ -276,7 +281,6 @@ class OrderBook:
                 triggered.append(o)
         for o in triggered:
             self.stop_orders.remove(o)
-            # convert stop to market or to limit
             if o.type == "STOP":
                 o.type = "MARKET"
                 o.price = None
@@ -295,7 +299,10 @@ class OrderBook:
                 remainder.status = "FILLED" if remainder.remaining == 0 else "CANCELLED"
                 self.order_map[remainder.order_id] = remainder
 
-    # ---- snapshots / export ----
+        # OFI after stop-driven changes
+        self.compute_ofi()
+
+    # Snapshot & export
     def snapshot_l2(self, depth: int = 12) -> Dict[str, List[Tuple[float, float]]]:
         bids = []
         asks = []
@@ -326,9 +333,36 @@ class OrderBook:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df.sort_values("timestamp")
 
-# ----------------------------------------
-# Market-realistic Simulator (autocorr, vol sensitivity, price impact)
-# ----------------------------------------
+    # OFI computation (top-of-book by default)
+    def compute_ofi(self, depth: int = 1) -> float:
+        """
+        OFI = (Bid added - Bid removed) - (Ask added - Ask removed)
+        Uses top depth levels (default 1). Updates self.ofi and prev_snapshot.
+        """
+        snap = self.snapshot_l2(depth=depth)
+        bids = snap.get("bids", [])
+        asks = snap.get("asks", [])
+
+        bid_vol = bids[0][1] if bids else 0.0
+        ask_vol = asks[0][1] if asks else 0.0
+
+        if self.prev_snapshot is None:
+            self.prev_snapshot = (bid_vol, ask_vol)
+            return self.ofi
+
+        prev_bid, prev_ask = self.prev_snapshot
+        bid_added = max(0.0, bid_vol - prev_bid)
+        bid_removed = max(0.0, prev_bid - bid_vol)
+        ask_added = max(0.0, ask_vol - prev_ask)
+        ask_removed = max(0.0, prev_ask - ask_vol)
+
+        self.ofi = (bid_added - bid_removed) - (ask_added - ask_removed)
+        self.prev_snapshot = (bid_vol, ask_vol)
+        return self.ofi
+
+# -----------------------
+# Market Simulator
+# -----------------------
 
 class MarketSimulator:
     def __init__(self, book: OrderBook,
@@ -340,42 +374,36 @@ class MarketSimulator:
         self.tick = tick
         self.rng = np.random.default_rng(seed)
         # Hawkes-like intensities
-        self.mu = 0.9                 # baseline rate (per second) total
-        self.alpha = 0.6              # self-excitation
-        self.decay = 1.5              # decay rate per second
+        self.mu = 0.9
+        self.alpha = 0.6
+        self.decay = 1.5
         self.intensity_buy = 0.5
         self.intensity_sell = 0.5
-        # momentum memory (for AR(1)-like autocorrelation)
+        # momentum memory
         self.momentum = 0.0
         self.mom_decay = 0.9
         self.mom_alpha = 0.25
-        # volatility tracking (realized vol of last N trades' log returns)
+        # vol tracking
         self.price_window = deque(maxlen=200)
-        # replenishment parameters
-        self.replenish_prob = 0.6     # probability to refill after a fill
-        self.iceberg_prob = 0.08      # chance an added passive is iceberg
-        # price impact scaling
+        # replenishment / iceberg
+        self.replenish_prob = 0.6
+        self.iceberg_prob = 0.08
+        # impact scaling
         self.base_impact = 0.2
         self.stress_scale = 2.0
 
-    # ---- utility metrics ----
     def update_after_trade(self, trade: TradeEvent):
-        # update momentum: buy = +1, sell = -1
         sign = 1 if trade.aggressor == "BUY" else -1
         self.momentum = self.mom_alpha * sign + self.mom_decay * self.momentum
-        # update intensities (Hawkes-like): bump the aggressive side
         if trade.aggressor == "BUY":
             self.intensity_buy += self.alpha
         else:
             self.intensity_sell += self.alpha
-        # store price for vol calc
         self.price_window.append(trade.price)
-        # small decay every update
         self.intensity_buy = max(0.01, self.intensity_buy * np.exp(-1.0 / self.decay))
         self.intensity_sell = max(0.01, self.intensity_sell * np.exp(-1.0 / self.decay))
 
     def realized_volatility(self, lookback: int = 60) -> float:
-        # compute realized volatility (std of log returns) on last lookback trades
         prices = list(self.price_window)[-lookback:]
         if len(prices) < 2:
             return 0.0
@@ -383,77 +411,57 @@ class MarketSimulator:
         return float(np.std(logrets, ddof=0))
 
     def stress_metric(self) -> float:
-        # combine vol and momentum to produce a stress value >=0
         vol = self.realized_volatility(60)
         mom = abs(self.momentum)
         return vol * self.stress_scale + mom
 
-    # ---- choose side with autocorrelation ----
     def choose_side(self) -> str:
-        # base buy prob adjusted by momentum (AR1-like)
-        base_buy_prob = 0.5 + 0.3 * np.tanh(self.momentum)  # momentum pushes p
-        # also modify by Hawkes intensities
+        base_buy_prob = 0.5 + 0.3 * np.tanh(self.momentum)
         total_intensity = self.intensity_buy + self.intensity_sell + 1e-12
         hawkes_buy = self.intensity_buy / total_intensity
         p_buy = 0.6 * base_buy_prob + 0.4 * hawkes_buy
         return "BUY" if self.rng.random() < p_buy else "SELL"
 
-    # ---- produce order sizes responsive to volatility ----
     def sample_order_size(self, side: str, is_market: bool = False) -> float:
         vol = self.realized_volatility(60)
-        # baseline size distribution
         if self.rng.random() < 0.9:
             size = self.rng.exponential(2.5) + 0.1
         else:
             size = self.rng.exponential(12) + 1.0
-        # vol sensitive: higher vol increases market order sizes and reduces passive sizes
         if vol > 0.0005:
-            # scale market orders more aggressively
             if is_market:
                 size *= (1.0 + min(6.0, vol * 300))
             else:
-                # passive limit sizes shrink under stress
                 size *= max(0.3, 1.0 - min(0.9, vol * 200))
         return round(float(size), 2)
 
-    # ---- price selection for limit orders (near mid) ----
     def sample_limit_price(self, side: str) -> float:
         mid = self.book.mid_price() or self.base_price
-        # jitter in ticks, narrower when calm, wider when stressed
         stress = self.stress_metric()
         std_ticks = max(1, int(1 + stress * 4))
         ticks = int(round(self.rng.normal(0, std_ticks)))
         return round_price(mid + (ticks * self.tick), self.tick)
 
-    # ---- price-impact: how deep to walk the book ----
     def compute_walk_depth(self, base_qty: float) -> int:
-        # deeper walk when stress is high or order is large relative to top size
         stress = self.stress_metric()
-        # base depth (levels)
         base_depth = 1 if stress < 0.5 else 1 + int(stress * 3)
-        # scale with size
         extra = int(min(10, base_qty / 2.0))
         return base_depth + extra
 
-    # ---- emit an order with price impact behaviour ----
     def emit_order(self, now: datetime):
         side = self.choose_side()
-        # decide market vs limit with stress sensitivity
         stress = self.stress_metric()
-        prob_market = 0.12 + 0.25 * min(1.0, stress)  # more market orders during stress
+        prob_market = 0.12 + 0.25 * min(1.0, stress)
         is_market = self.rng.random() < prob_market
         size = self.sample_order_size(side, is_market=is_market)
+
         if is_market:
-            # market order should walk the book deeper depending on stress & size
-            # compute intended depth and then consume quantities
             depth = self.compute_walk_depth(size)
-            # we create a MARKET order and then manually execute sweeping deeper via book.submit_order
-            # To implement deeper walk, we simply submit a MARKET order with a larger qty.
+            # Use market order submit; the matching core will walk as needed
             self.book.submit_order(side=side, order_type="MARKET", qty=size, price=None, now=now)
         else:
-            # limit order: choose price near mid, but sometimes cross (simulate taker-on-limit)
+            # sometimes cross on best to simulate taker-on-limit
             if self.rng.random() < (0.18 + 0.15 * min(1.0, stress)):
-                # cross: submit at opposite best to take liquidity
                 ba = self.book.best_ask()
                 bb = self.book.best_bid()
                 if side == "BUY" and ba:
@@ -466,49 +474,37 @@ class MarketSimulator:
                     price = self.sample_limit_price(side)
                     self.book.submit_order(side=side, order_type="LIMIT", qty=size, price=price, now=now)
             else:
-                # post passive near mid; sometimes make it iceberg
                 price = self.sample_limit_price(side)
                 is_ice = self.rng.random() < self.iceberg_prob
                 if is_ice:
                     total = round(size * (2 + self.rng.integers(0, 6)), 2)
                     display = round(max(0.1, size), 2)
-                    # create displayed slice now, while total is larger
                     self.book.submit_order(side=side, order_type="LIMIT", qty=display, price=price, now=now,
                                            iceberg_total=total, iceberg_display=display)
                 else:
                     self.book.submit_order(side=side, order_type="LIMIT", qty=size, price=price, now=now)
 
-    # ---- replenishment after fills (refill behaviour) ----
     def replenish_after_trades(self):
-        # examine recent trades and probabilistically refill levels that were hit
-        # For simplicity: for each trade, with probability, post an order on same side/opposite side at same price
         recent_trades = self.book.trades_to_df().tail(20)
         for _, row in recent_trades.iterrows():
             if self.rng.random() < self.replenish_prob:
-                # after heavy hit, replenish opposite side with some C-shaped size near price
                 price = row['price']
-                # choose side: replenish same side that was taken (makers side) or opposite.
-                # We'll post passive orders around price
                 side = "BUY" if self.rng.random() < 0.5 else "SELL"
-                # size drawn from c-shaped curve generator
                 size = round(1.0 + abs(self.rng.normal(0, 2.0)), 2)
-                # small jitter around price
                 p = round_price(price + (self.rng.integers(-2, 3) * self.tick), self.tick)
                 self.book.submit_order(side=side, order_type="LIMIT", qty=size, price=p, now=datetime.now(UTC))
 
-    # ---- seed book with C-shaped depth curve ----
+        # OFI after replenishments
+        self.book.compute_ofi()
+
     def seed_depth_cshape(self, depth_levels: int = 20, base_qty: float = 50.0):
-        """Create a C-shaped depth curve: large near best, decays exponentially away from mid."""
         mid = self.base_price
-        decay = 0.12  # controls how fast qty decays with ticks
-        # create symmetric levels around mid
+        decay = 0.12
         for lvl in range(1, depth_levels + 1):
             price_up = round_price(mid + lvl * self.tick, self.tick)
             price_dn = round_price(mid - lvl * self.tick, self.tick)
-            # quantity follows C-shape: heavy near best (lvl small), decays exponentially
             qty_up = max(0.5, base_qty * np.exp(-decay * lvl) * (1.0 + 0.1 * self.rng.normal()))
             qty_dn = max(0.5, base_qty * np.exp(-decay * lvl) * (1.0 + 0.1 * self.rng.normal()))
-            # post multiple small orders at each level to create FIFO queue
             for _ in range(self.rng.integers(1, 4)):
                 self.book.submit_order("SELL", "LIMIT", qty=round(float(qty_up / self.rng.integers(1,4)), 2),
                                        price=price_up, now=datetime.now(UTC))
@@ -516,30 +512,22 @@ class MarketSimulator:
                 self.book.submit_order("BUY", "LIMIT", qty=round(float(qty_dn / self.rng.integers(1,4)), 2),
                                        price=price_dn, now=datetime.now(UTC))
 
-    # ---- step function to be called each second ----
     def step(self, now: datetime, seconds: float = 1.0):
-        # decay momentum slightly each second (already handled in update_after_trade but ensure bounded)
         self.momentum = getattr(self, "momentum", 0.0) * 0.995 if hasattr(self, "momentum") else 0.0
-
-        # sample number of events this second from Poisson with baseline + intensities
         base_rate = self.mu
-        # combine intensities roughly
         effective_rate = base_rate + 0.1 * (self.intensity_buy + self.intensity_sell)
         n = self.rng.poisson(lam=max(0.5, effective_rate) * seconds)
         for _ in range(n):
             self.emit_order(now)
-            # after emitting, incorporate any trades into momentum/intensity updates
-            # read recent trades generated by book and update simulator state
             if self.book.trade_log:
                 last_trade = self.book.trade_log[-1]
                 self.update_after_trade(last_trade)
-        # occasionally replenish
         if self.rng.random() < 0.3:
             self.replenish_after_trades()
 
-# ----------------------------------------
-# Candle aggregation & plotting (unchanged)
-# ----------------------------------------
+# -----------------------
+# Aggregation & Plotting
+# -----------------------
 
 def aggregate_trades_to_candles(trades_df: pd.DataFrame, start: datetime, end: datetime, freq: str = '60S') -> pd.DataFrame:
     if trades_df.empty:
@@ -574,7 +562,6 @@ def heikin_ashi(candles: pd.DataFrame) -> pd.DataFrame:
     }, index=candles.index)
     return res
 
-# plotting building blocks using plotly
 def build_candlestick_figure(candles: pd.DataFrame, trades_df: pd.DataFrame, use_heikin: bool = True):
     fig = go.Figure()
     if candles.empty:
@@ -586,7 +573,8 @@ def build_candlestick_figure(candles: pd.DataFrame, trades_df: pd.DataFrame, use
                                  name='Candles (1m)'))
     if not trades_df.empty:
         df = trades_df.sort_values('timestamp').copy()
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['price'], mode='markers', name='Trades', marker={'size':5, 'opacity':0.6}))
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['price'], mode='markers', name='Trades',
+                                 marker={'size':5, 'opacity':0.6}))
     fig.update_layout(template='plotly_dark', xaxis_rangeslider_visible=False, height=600)
     return fig
 
@@ -596,15 +584,28 @@ def build_l2_figure(book: OrderBook, depth: int = 12):
     asks = snap['asks']
     fig = go.Figure()
     if bids:
-        fig.add_trace(go.Bar(x=[q for (_, q) in bids], y=[str(p) for (p, _) in bids], orientation='h', name='Bids', marker_color='green'))
+        fig.add_trace(go.Bar(x=[q for (_, q) in bids], y=[str(p) for (p, _) in bids], orientation='h',
+                             name='Bids', marker_color='green'))
     if asks:
-        fig.add_trace(go.Bar(x=[q for (_, q) in asks], y=[str(p) for (p, _) in asks], orientation='h', name='Asks', marker_color='red'))
+        fig.add_trace(go.Bar(x=[q for (_, q) in asks], y=[str(p) for (p, _) in asks], orientation='h',
+                             name='Asks', marker_color='red'))
     fig.update_layout(template='plotly_dark', height=500)
     return fig
 
-# ----------------------------------------
-# Dash App wiring (Interval-driven)
-# ----------------------------------------
+def build_ofi_figure(times_iso: List[str], values: List[float]):
+    fig = go.Figure()
+    if len(times_iso) > 0:
+        # convert ISO strings to datetimes for plotting
+        times = pd.to_datetime(times_iso)
+        fig.add_trace(go.Scatter(x=times, y=values, mode='lines', line=dict(width=2), name='OFI'))
+    # zero-line
+    fig.add_hline(y=0, line=dict(color='gray', width=1, dash='dot'))
+    fig.update_layout(template='plotly_dark', height=180, margin=dict(l=40, r=20, t=10, b=40))
+    return fig
+
+# -----------------------
+# Dash App & Callbacks
+# -----------------------
 
 def create_app(book: OrderBook, sim: MarketSimulator):
     app = Dash(__name__)
@@ -613,77 +614,106 @@ def create_app(book: OrderBook, sim: MarketSimulator):
             html.H4("Realistic Market Order Book Simulator", style={'color':'#ddd'}),
             html.Div(id='stats', style={'color':'#ddd'})
         ]),
+
+        # Left column: candles + OFI
         html.Div([
-            dcc.Graph(id='candles-graph')
+            dcc.Graph(id='candles-graph'),
+            dcc.Graph(id='ofi-graph')
         ], style={'width':'70%', 'display':'inline-block', 'verticalAlign':'top'}),
+
+        # Right column: L2 + controls
         html.Div([
             dcc.Graph(id='l2-graph'),
-            html.Div([
-                html.Button("Pause/Resume", id='pause', n_clicks=0),
-            ], style={'paddingTop':'8px'})
+            html.Div([html.Button("Pause/Resume", id='pause', n_clicks=0)], style={'paddingTop':'8px'})
         ], style={'width':'28%', 'display':'inline-block', 'paddingLeft':'8px'}),
+
         dcc.Interval(id='interval', interval=1000, n_intervals=0),
+
+        # Store OFI history (ISO string timestamps) and paused state
+        dcc.Store(id='ofi-store', data={'times': [], 'values': []}),
         dcc.Store(id='paused', data=False)
     ], style={'backgroundColor':'#111', 'padding':10})
 
-    @app.callback(Output('paused', 'data'), Input('pause', 'n_clicks'), State='paused')
+    @app.callback(Output('paused', 'data'), Input('pause', 'n_clicks'), State('paused', 'data'))
     def toggle_pause(n_clicks, state):
-        # toggle on every click
         if n_clicks is None:
             return False
         return not state
 
     @app.callback(
         Output('candles-graph', 'figure'),
+        Output('ofi-graph', 'figure'),
         Output('l2-graph', 'figure'),
         Output('stats', 'children'),
+        Output('ofi-store', 'data'),
         Input('interval', 'n_intervals'),
-        Input('paused', 'data')
+        Input('paused', 'data'),
+        State('ofi-store', 'data')
     )
-    def update(n_intervals, paused):
-        now = datetime.now(UTC).replace(microsecond=0)
+    def update(n_intervals, paused, ofi_store):
+        now_dt = datetime.now(UTC).replace(microsecond=0)
         if not paused:
-            # run simulation step(s)
-            sim.step(now, seconds=1.0)
-        # build visuals
+            sim.step(now_dt, seconds=1.0)
+
         trades_df = book.trades_to_df()
-        # 60-minute sliding window for candles
-        end = now + timedelta(seconds=1)
-        start = now - timedelta(minutes=60)
+
+        # candles over last 60 minutes
+        end = now_dt + timedelta(seconds=1)
+        start = now_dt - timedelta(minutes=60)
         candles = aggregate_trades_to_candles(trades_df, start, end)
         candle_fig = build_candlestick_figure(candles, trades_df, use_heikin=True)
+
+        # L2 snapshot
         l2_fig = build_l2_figure(book, depth=12)
+
+        # Stats
         bb = book.best_bid()
         ba = book.best_ask()
         spread = None
         mid = book.mid_price()
         if bb and ba:
             spread = round(ba[0] - bb[0], 8)
+
+        # Update OFI history store (use ISO timestamps for safe JSON storage)
+        ofi_val = round(book.ofi, 6)
+        ts_list = ofi_store.get('times', []) if ofi_store else []
+        vals_list = ofi_store.get('values', []) if ofi_store else []
+        ts_list.append(now_dt.isoformat())
+        vals_list.append(ofi_val)
+
+        # Keep recent history (e.g., last 1200 points)
+        ts_list = ts_list[-1200:]
+        vals_list = vals_list[-1200:]
+
+        ofi_fig = build_ofi_figure(ts_list, vals_list)
+
         stats = [
             html.Div(f"Best Bid: {bb}", style={'color':'#ccc'}),
             html.Div(f"Best Ask: {ba}", style={'color':'#ccc'}),
             html.Div(f"Spread: {spread}", style={'color':'#ccc'}),
             html.Div(f"Mid: {mid}", style={'color':'#ccc'}),
             html.Div(f"Last Trade: {book.last_trade_price}", style={'color':'#ccc'}),
-            html.Div(f"Stress Metric: {round(sim.stress_metric(),6)}", style={'color':'#ccc'})
+            html.Div(f"Stress Metric: {round(sim.stress_metric(),6)}", style={'color':'#ccc'}),
+            html.Div(f"OFI: {ofi_val}", style={'color':'#ccc'})
         ]
-        return candle_fig, l2_fig, stats
+
+        return candle_fig, ofi_fig, l2_fig, stats, {'times': ts_list, 'values': vals_list}
 
     return app
 
-# ----------------------------------------
-# Entrypoint: assemble everything and run
-# ----------------------------------------
+# -----------------------
+# Entrypoint
+# -----------------------
 
 def main():
     tick = 0.25
     book = OrderBook(tick_size=tick)
     sim = MarketSimulator(book=book, base_price=100.0, tick=tick, seed=42)
 
-    # seed depth with C-shaped curve
+    # Seed book
     sim.seed_depth_cshape(depth_levels=18, base_qty=80.0)
 
-    # run Dash
+    # Run app
     app = create_app(book, sim)
     app.run(debug=False, port=8050)
 
