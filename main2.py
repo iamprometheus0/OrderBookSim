@@ -118,7 +118,7 @@ def match_once():
     best_ask_price, best_ask_qty = asks[0]
 
     if best_bid_price >= best_ask_price:
-        # execute at ask price
+        # execute at ask price (common convention)
         trade_price = best_ask_price
         trade_qty = min(best_bid_qty, best_ask_qty)
         ts = now_sim_datetime()
@@ -328,3 +328,4 @@ def run_simulation():
 
 if __name__ == "__main__":
     run_simulation()
+
