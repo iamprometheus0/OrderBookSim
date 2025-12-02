@@ -18,7 +18,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 import plotly.graph_objects as go
 
 # ----------------------------------------
@@ -77,6 +77,10 @@ class OrderBook:
         self._trade_seq = 0
         self.last_trade_price: Optional[float] = None
         self.last_trade_time: Optional[datetime] = None
+
+        # OFI tracking: previous top-of-book snapshot and current OFI
+        self.prev_snapshot: Optional[Tuple[float, float]] = None
+        self.ofi: float = 0.0
 
     # ---- sequence helpers ----
     def _next_seq(self) -> int:
@@ -160,6 +164,8 @@ class OrderBook:
         if order_type in ("STOP", "STOP_LIMIT"):
             self.stop_orders.append(o)
             self.order_map[oid] = o
+            # compute OFI because an order was added to stop_orders (book state change)
+            self.compute_ofi()
             return o
 
         # Route to matching core
@@ -181,6 +187,9 @@ class OrderBook:
 
         # After trades, check stops & triggers
         self._check_stop_triggers(now)
+
+        # compute OFI after the state changes caused by this submission
+        self.compute_ofi()
         return remainder
 
     def cancel_order(self, order_id: str) -> bool:
@@ -196,6 +205,8 @@ class OrderBook:
                     dq.remove(el)
                     o.status = "CANCELLED"
                     self._remove_level_if_empty(price, side)
+                    # OFI changes because book volume removed
+                    self.compute_ofi()
                     return True
         return False
 
@@ -295,6 +306,9 @@ class OrderBook:
                 remainder.status = "FILLED" if remainder.remaining == 0 else "CANCELLED"
                 self.order_map[remainder.order_id] = remainder
 
+        # OFI may have changed due to triggered orders being converted/executed
+        self.compute_ofi()
+
     # ---- snapshots / export ----
     def snapshot_l2(self, depth: int = 12) -> Dict[str, List[Tuple[float, float]]]:
         bids = []
@@ -325,6 +339,39 @@ class OrderBook:
         df = pd.DataFrame(rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df.sort_values("timestamp")
+
+    # ---- OFI computation ----
+    def compute_ofi(self, depth: int = 1) -> float:
+        """
+        Compute Order Flow Imbalance (OFI) using top-of-book changes.
+        OFI = (Bid added - Bid removed) - (Ask added - Ask removed)
+        Only uses top depth levels (default 1).
+        Updates self.ofi and self.prev_snapshot.
+        """
+        snap = self.snapshot_l2(depth=depth)
+        bids = snap.get("bids", [])
+        asks = snap.get("asks", [])
+
+        bid_vol = bids[0][1] if bids else 0.0
+        ask_vol = asks[0][1] if asks else 0.0
+
+        if self.prev_snapshot is None:
+            # initialize snapshot, keep OFI as-is (likely 0)
+            self.prev_snapshot = (bid_vol, ask_vol)
+            return self.ofi
+
+        prev_bid, prev_ask = self.prev_snapshot
+
+        bid_added = max(0.0, bid_vol - prev_bid)
+        bid_removed = max(0.0, prev_bid - bid_vol)
+        ask_added = max(0.0, ask_vol - prev_ask)
+        ask_removed = max(0.0, prev_ask - ask_vol)
+
+        self.ofi = (bid_added - bid_removed) - (ask_added - ask_removed)
+
+        # update snapshot
+        self.prev_snapshot = (bid_vol, ask_vol)
+        return self.ofi
 
 # ----------------------------------------
 # Market-realistic Simulator (autocorr, vol sensitivity, price impact)
@@ -496,6 +543,9 @@ class MarketSimulator:
                 p = round_price(price + (self.rng.integers(-2, 3) * self.tick), self.tick)
                 self.book.submit_order(side=side, order_type="LIMIT", qty=size, price=p, now=datetime.now(UTC))
 
+        # ensure OFI updated after replenishment-based submissions
+        self.book.compute_ofi()
+
     # ---- seed book with C-shaped depth curve ----
     def seed_depth_cshape(self, depth_levels: int = 20, base_qty: float = 50.0):
         """Create a C-shaped depth curve: large near best, decays exponentially away from mid."""
@@ -626,7 +676,7 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         dcc.Store(id='paused', data=False)
     ], style={'backgroundColor':'#111', 'padding':10})
 
-    @app.callback(Output('paused', 'data'), Input('pause', 'n_clicks'), State='paused')
+    @app.callback(Output('paused', 'data'), Input('pause', 'n_clicks'), State('paused', 'data'))
     def toggle_pause(n_clicks, state):
         # toggle on every click
         if n_clicks is None:
@@ -665,7 +715,8 @@ def create_app(book: OrderBook, sim: MarketSimulator):
             html.Div(f"Spread: {spread}", style={'color':'#ccc'}),
             html.Div(f"Mid: {mid}", style={'color':'#ccc'}),
             html.Div(f"Last Trade: {book.last_trade_price}", style={'color':'#ccc'}),
-            html.Div(f"Stress Metric: {round(sim.stress_metric(),6)}", style={'color':'#ccc'})
+            html.Div(f"Stress Metric: {round(sim.stress_metric(),6)}", style={'color':'#ccc'}),
+            html.Div(f"OFI: {round(book.ofi,4)}", style={'color':'#ccc'})
         ]
         return candle_fig, l2_fig, stats
 
