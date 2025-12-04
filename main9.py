@@ -247,7 +247,6 @@ class OrderBook:
     def _next_trade_seq(self) -> int:
         self._trade_seq += 1
         return self._trade_seq
-
     # ---- price-level helpers ----
     def _insert_level(self, price: float, side: str):
         if side == "BUY":
@@ -524,8 +523,6 @@ class OrderBook:
         # update snapshot
         self.prev_snapshot = (bid_vol, ask_vol)
         return self.ofi
-
-
 # -----------------------
 # Market-realistic Simulator
 # -----------------------
@@ -862,8 +859,6 @@ def build_regime_scatter(times_iso: List[str], ofi_vals: List[float], stress_val
     fig.update_layout(template='plotly_dark', height=300, xaxis_title='OFI', yaxis_title='Stress',
                       margin=dict(l=40, r=20, t=20, b=30))
     return fig
-
-
 # -----------------------
 # Dash App wiring (Interval-driven)
 # -----------------------
@@ -900,6 +895,10 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         dcc.Store(id='ofi-store', data={'times': [], 'values': []}),
         # regime-store now includes times, ofi, stress, and regimes
         dcc.Store(id='regime-store', data={'times': [], 'ofi': [], 'stress': [], 'regimes': []}),
+        # NEW: dataset store + export UI
+        dcc.Store(id='dataset-store', data=[]),
+        html.Button("Export synthetic_dataset.csv", id='export-btn', n_clicks=0, style={'marginTop':'8px'}),
+        dcc.Download(id='download-csv'),
         dcc.Store(id='paused', data=False)
     ], style={'backgroundColor':'#111', 'padding':10})
 
@@ -917,6 +916,7 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         Output('regime-timeline', 'figure'),
         Output('l2-graph', 'figure'),
         Output('stats', 'children'),
+        Output('dataset-store', 'data'),            # <-- NEW Output (dataset)
         Output('ofi-store', 'data'),
         Output('regime-store', 'data'),
         Input('interval', 'n_intervals'),
@@ -924,14 +924,17 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         Input('alpha-slider', 'value'),
         Input('decay-slider', 'value'),
         State('ofi-store', 'data'),
-        State('regime-store', 'data')
+        State('regime-store', 'data'),
+        State('dataset-store', 'data')
     )
-    def update(n_intervals, paused, alpha_val, decay_val, ofi_store, regime_store):
+    def update(n_intervals, paused, alpha_val, decay_val, ofi_store, regime_store, dataset_store):
         # Ensure stores are valid
         if ofi_store is None:
             ofi_store = {'times': [], 'values': []}
         if regime_store is None:
             regime_store = {'times': [], 'ofi': [], 'stress': [], 'regimes': []}
+        if dataset_store is None:
+            dataset_store = []
 
         # Update simulator momentum params from sliders
         sim.mom_alpha = float(alpha_val)
@@ -1045,6 +1048,48 @@ def create_app(book: OrderBook, sim: MarketSimulator):
                                    yaxis=dict(showgrid=False, visible=False),
                                    margin=dict(l=20, r=20, t=20, b=20))
 
+        # --------------------------
+        # Build dataset row and append to dataset-store
+        # --------------------------
+        ds = dataset_store or []
+
+        # prepare OHLC for latest candle if available
+        mid_price_val = (book.mid_price() or None)
+        o, h, l, cl = (None, None, None, None)
+        if isinstance(candles, pd.DataFrame) and not candles.empty:
+            latest = candles.iloc[-1]
+            # If your candles use numeric types ensure conversion:
+            try:
+                o = float(latest['open'])
+                h = float(latest['high'])
+                l = float(latest['low'])
+                cl = float(latest['close'])
+            except Exception:
+                # graceful fallback if columns names differ or NaN
+                o = latest.get('open', None)
+                h = latest.get('high', None)
+                l = latest.get('low', None)
+                cl = latest.get('close', None)
+
+        row = {
+            'timestamp': now.isoformat(),
+            'regime_label': regime_label,
+            'trend_score': float(trend_score),
+            'vol_bucket': vol_bucket,
+            'realized_volatility': float(realized_vol),
+            'stress_metric': float(current_stress),
+            'mid_price': mid_price_val,
+            'open': o,
+            'high': h,
+            'low': l,
+            'close': cl
+        }
+
+        ds.append(row)
+        # trim history to last N rows to avoid unbounded growth (optional)
+        ds = ds[-20000:]   # keep last 20k rows max; adjust as needed
+        dataset_store_out = ds
+
         # Prepare stats
         bb = book.best_bid()
         ba = book.best_ask()
@@ -1071,7 +1116,38 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         ofi_store_out = {'times': ts, 'values': vals}
         regime_store_out = {'times': r_ts, 'ofi': r_ofi, 'stress': r_stress, 'regimes': r_regimes}
 
-        return candle_fig, ofi_fig, regime_scatter_fig, timeline_fig, l2_fig, stats, ofi_store_out, regime_store_out
+        return candle_fig, ofi_fig, regime_scatter_fig, timeline_fig, l2_fig, stats, dataset_store_out, ofi_store_out, regime_store_out
+
+    # --------------------------
+    # Export dataset callback
+    # --------------------------
+    @app.callback(
+        Output('download-csv', 'data'),
+        Input('export-btn', 'n_clicks'),
+        State('dataset-store', 'data'),
+        prevent_initial_call=True
+    )
+    def export_dataset(n_clicks, dataset):
+        # dataset is a list of dicts — turn into DataFrame and stream as CSV
+        if not dataset:
+            # return empty CSV if nothing collected
+            empty_df = pd.DataFrame(columns=[
+                'timestamp','regime_label','trend_score','vol_bucket','realized_volatility',
+                'stress_metric','mid_price','open','high','low','close'
+            ])
+            return dcc.send_data_frame(empty_df.to_csv, "synthetic_dataset.csv", index=False)
+
+        df = pd.DataFrame(dataset)
+        # Ensure column ordering
+        cols = ['timestamp','regime_label','trend_score','vol_bucket','realized_volatility',
+                'stress_metric','mid_price','open','high','low','close']
+        df = df.reindex(columns=cols)
+        # Optionally convert numeric columns to numeric dtypes
+        for c in ['trend_score','realized_volatility','stress_metric','mid_price','open','high','low','close']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        return dcc.send_data_frame(df.to_csv, "synthetic_dataset.csv", index=False)
 
     return app
 
@@ -1094,4 +1170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
