@@ -542,6 +542,9 @@ class MarketSimulator:
         self.decay = 1.5              # decay rate per second
         self.intensity_buy = 0.5
         self.intensity_sell = 0.5
+        # --- NEW: global event rate multiplier ---
+        self.event_multiplier = 600.0   # increase for more tick generation
+
         # momentum memory (for AR(1)-like autocorrelation)
         self.momentum = 0.0
         # sliders will control these
@@ -719,7 +722,7 @@ class MarketSimulator:
         base_rate = self.mu
         # combine intensities roughly
         effective_rate = base_rate + 0.1 * (self.intensity_buy + self.intensity_sell)
-        n = self.rng.poisson(lam=max(0.5, effective_rate) * seconds)
+        n = self.rng.poisson(lam=max(0.5, effective_rate * self.event_multiplier) * seconds)
         for _ in range(n):
             self.emit_order(now)
             # after emitting, incorporate any trades into momentum/intensity updates
@@ -1071,8 +1074,12 @@ def create_app(book: OrderBook, sim: MarketSimulator):
                 l = latest.get('low', None)
                 cl = latest.get('close', None)
 
+        # Split timestamp into date + time
+        date_str = now.date().isoformat()
+        time_str = now.time().isoformat()
         row = {
-            'timestamp': now.isoformat(),
+            'date': date_str,
+            'time': time_str,
             'regime_label': regime_label,
             'trend_score': float(trend_score),
             'vol_bucket': vol_bucket,
@@ -1132,14 +1139,14 @@ def create_app(book: OrderBook, sim: MarketSimulator):
         if not dataset:
             # return empty CSV if nothing collected
             empty_df = pd.DataFrame(columns=[
-                'timestamp','regime_label','trend_score','vol_bucket','realized_volatility',
+                'date','time','regime_label','trend_score','vol_bucket','realized_volatility',
                 'stress_metric','mid_price','open','high','low','close'
             ])
             return dcc.send_data_frame(empty_df.to_csv, "synthetic_dataset.csv", index=False)
 
         df = pd.DataFrame(dataset)
         # Ensure column ordering
-        cols = ['timestamp','regime_label','trend_score','vol_bucket','realized_volatility',
+        cols = ['date','time','regime_label','trend_score','vol_bucket','realized_volatility',
                 'stress_metric','mid_price','open','high','low','close']
         df = df.reindex(columns=cols)
         # Optionally convert numeric columns to numeric dtypes
